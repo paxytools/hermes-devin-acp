@@ -27,6 +27,9 @@ https://github.com/paxytools/hermes-devin-acp.git
 
 ```bash
 hermes plugins install paxytools/hermes-devin-acp
+```
+
+```bash
 hermes plugins enable devin-acp
 ```
 
@@ -51,3 +54,7 @@ You're all set.
 ```bash
 hermes plugins remove devin-acp
 ```
+
+## Disclaimer
+
+This plugin is provided "as is", without warranty of any kind, express or implied. The authors and contributors are not liable for any damages, data loss, or unintended actions resulting from the use of this plugin, including but not limited to command execution, file modifications, or any operations performed by Devin through the ACP interface. Use at your own risk.

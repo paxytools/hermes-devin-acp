@@ -145,8 +145,15 @@ class DevinACPClient(Any):  # type: ignore[misc]
                     # We approve so Devin can run its native tools (exec, read, edit).
                     params = msg.get("params") or {}
                     options = params.get("options") or []
-                    # Build a description of what Devin wants to do for the approval prompt.
-                    perm_desc = params.get("description") or ""
+                    # Extract the actual command from Devin's permission request.
+                    # Devin sends the real command in toolCall._meta.cognition.ai/editableCommand.
+                    tool_call = params.get("toolCall") or {}
+                    meta = tool_call.get("_meta") or {}
+                    perm_desc = (
+                        meta.get("cognition.ai/editableCommand")
+                        or params.get("description")
+                        or ""
+                    )
                     if not perm_desc:
                         for opt in options:
                             if isinstance(opt, dict) and opt.get("name"):
@@ -154,58 +161,61 @@ class DevinACPClient(Any):  # type: ignore[misc]
                                 break
                         if not perm_desc:
                             perm_desc = "Devin requests permission to run a tool"
-                    option_id = ""
-                    # 1. Try the terminal tool's approval callback (set in CLI mode).
+                    # option_id stays None when the gate denies/fails → we send reject_once.
+                    # It's only set to "allow_once" when the gate explicitly approves.
+                    option_id = None
+                    # Pass through Hermes' built-in approval gate. The ACP handler thread
+                    # isn't recognized as interactive by default, so we set the interactive
+                    # contextvar first when a user is watching (main turn active). Then
+                    # check_all_command_guards handles everything: dangerous detection,
+                    # CLI prompt, gateway push (Telegram/Discord), TUI/desktop clarify,
+                    # and cron/kanban/unattended config. Safe commands pass through in
+                    # ALL contexts; only dangerous ones get gated.
                     try:
-                        from tools.terminal_tool import _get_approval_callback
-                        cb = _get_approval_callback()
-                        if cb is not None:
-                            choice = cb("", perm_desc, allow_permanent=True)
-                            _choice_map = {
-                                "once": "allow_once",
-                                "session": "allow_session",
-                                "always": "allow_always",
-                            }
-                            if choice in _choice_map:
-                                option_id = _choice_map[choice]
+                        from tools.approval_context import (
+                            set_hermes_interactive_context, reset_hermes_interactive_context,
+                        )
+                        from tools.approval import check_all_command_guards
+                        # Mark interactive only when a user is watching (main turn active).
+                        # Background tasks (title gen, cron, kanban) stay non-interactive
+                        # so the gate applies cron_mode/single_query_mode/unattended_mode.
+                        _interactive = self._devin_agent() is not None
+                        _token = set_hermes_interactive_context(_interactive)
+                        try:
+                            result = check_all_command_guards(perm_desc, env_type="local")
+                        finally:
+                            reset_hermes_interactive_context(_token)
+                        if result.get("approved"):
+                            option_id = "allow_once"
                     except Exception:
-                        pass
-                    # 2. If no CLI callback, try the gateway's _block mechanism (desktop/TUI).
-                    if not option_id:
-                        sid = self._devin_sid()
-                        if sid:
-                            try:
-                                from tui_gateway.server import _block
-                                choices = ["Allow once", "Allow for session", "Always allow", "Deny"]
-                                answer = _block("clarify.request", sid, {
-                                    "question": perm_desc,
-                                    "choices": choices,
-                                }, timeout=300)
-                                _gateway_map = {
-                                    "Allow once": "allow_once",
-                                    "Allow for session": "allow_session",
-                                    "Always allow": "allow_always",
-                                    "Deny": "",
-                                }
-                                option_id = _gateway_map.get(answer, "")
-                            except Exception:
-                                pass
-                    # 3. Fallback: auto-approve (no callback available, e.g. cron/title gen).
-                    if not option_id:
-                        option_id = "allow_always"
-                    # Verify the chosen option is actually offered by Devin.
-                    offered = {opt.get("optionId", "") for opt in options if isinstance(opt, dict)}
-                    if offered and option_id not in offered:
-                        for fallback in ("allow_always", "allow_session", "allow_once"):
-                            if fallback in offered:
-                                option_id = fallback
-                                break
+                        # Fail closed: do NOT approve on exception.
+                        option_id = None
+                    # Only verify the option if the gate approved. If the gate denied or
+                    # threw, option_id stays None and we select reject_once to tell Devin
+                    # to stop retrying (cancelled alone causes Devin to retry the command).
+                    if option_id is not None:
+                        offered = {opt.get("optionId", "") for opt in options if isinstance(opt, dict)}
+                        if offered and option_id not in offered:
+                            for fallback in ("allow_once", "allow_session", "allow_always"):
+                                if fallback in offered:
+                                    option_id = fallback
+                                    break
+                            else:
+                                # allow_once not offered → deny rather than grant permanent.
+                                option_id = None
                     if option_id:
                         response = {"jsonrpc": "2.0", "id": message_id,
                                     "result": {"outcome": {"outcome": "selected", "optionId": option_id}}}
                     else:
-                        response = {"jsonrpc": "2.0", "id": message_id,
-                                    "result": {"outcome": {"outcome": "cancelled"}}}
+                        # Gate denied or threw: prefer reject_once (tells Devin to stop),
+                        # fall back to cancelled if reject_once isn't offered.
+                        offered = {opt.get("optionId", "") for opt in options if isinstance(opt, dict)}
+                        if "reject_once" in offered:
+                            response = {"jsonrpc": "2.0", "id": message_id,
+                                        "result": {"outcome": {"outcome": "selected", "optionId": "reject_once"}}}
+                        else:
+                            response = {"jsonrpc": "2.0", "id": message_id,
+                                        "result": {"outcome": {"outcome": "cancelled"}}}
                     if process.stdin is not None:
                         process.stdin.write(json.dumps(response) + "\n")
                         process.stdin.flush()
