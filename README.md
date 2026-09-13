@@ -27,14 +27,27 @@ https://github.com/paxytools/hermes-devin-acp.git
 
 ```bash
 hermes plugins install paxytools/hermes-devin-acp
+hermes plugins enable devin-acp
 ```
 
 ## Configure
 
-After installing, activate the provider in Hermes:
+1. Go to **Settings → Providers** and select **Devin ACP**:
+
+   ![Provider list](screenshots/provider-1.png)
+
+2. Run `devin auth login` in your terminal, then click **I've signed in**:
+
+   ![Sign in](screenshots/provider-2.png)
+
+3. Select your model and click **Begin**:
+
+   ![Select model](screenshots/provider-3.png)
+
+You're all set.
+
+## Uninstall
 
 ```bash
-hermes model
+hermes plugins remove devin-acp
 ```
-
-Select `devin-acp` from the provider list and choose your model. Hermes handles the config automatically — no manual `config.yaml` editing needed.

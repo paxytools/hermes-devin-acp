@@ -406,7 +406,7 @@ class DevinACPProfile(ProviderProfile):
 devin_acp = DevinACPProfile(
     name="devin-acp",
     aliases=("devin", "devin-subscription"),
-    display_name="Devin Subscription",
+    display_name="Devin ACP",
     description="Devin CLI models using your authenticated subscription",
     signup_url="https://app.devin.ai/",
     api_mode="chat_completions",
@@ -452,8 +452,8 @@ try:
 
     if not any(p.slug == "devin-acp" for p in CANONICAL_PROVIDERS):
         CANONICAL_PROVIDERS.append(ProviderEntry(
-            "devin-acp", "Devin Subscription",
-            "Devin Subscription (Spawns devin acp --stdio, uses your Devin CLI login)",
+            "devin-acp", "Devin ACP",
+            "Devin ACP (Spawns devin acp --stdio, uses your Devin CLI login)",
         ))
 except Exception:
     pass  # non-fatal; /model <id> --provider devin-acp still works without this.
