@@ -1,0 +1,6 @@
+name: devin-acp
+kind: model-provider
+version: 0.1.0
+description: Devin subscription provider via ACP stdio — uses your authenticated Devin CLI (no API key)
+author: paxytools
+homepage: https://github.com/paxytools/hermes-devin-acp

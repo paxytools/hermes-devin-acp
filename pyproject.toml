@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-devin-acp"
+version = "0.1.0"
+description = "Devin subscription provider for Hermes Agent via ACP"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "paxytools" }]
+keywords = ["hermes", "devin", "acp", "ai", "agent"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+# pip install path: entry point imports the module for its register_provider side effect.
+# hermes plugins install path: clones the repo into ~/.hermes/plugins/devin-acp/
+# and discovery imports __init__.py at the root.
+[project.entry-points."hermes_agent.plugins"]
+devin-acp = "hermes_devin_acp"
+
+[tool.setuptools]
+py-modules = ["hermes_devin_acp"]
