@@ -135,7 +135,7 @@ class DevinACPClient(Any):  # type: ignore[misc]
                     self._devin_persist(agent, "", "devin_thinking", reasoning=think_text)
                     self._devin_think_buffer = ""
 
-            def _handle_server_message(self, msg, *, process, cwd, text_parts, reasoning_parts):
+            def _handle_server_message(self, msg, *, process, cwd, text_parts, reasoning_parts, allow_file_requests=True):
                 method = msg.get("method", "")
                 if method == "session/request_permission":
                     import json
@@ -322,7 +322,7 @@ class DevinACPClient(Any):  # type: ignore[misc]
                                     _log.error("devin_tool: tool_call_update handler failed: %s", e, exc_info=True)
                 return super()._handle_server_message(
                     msg, process=process, cwd=cwd, text_parts=text_parts,
-                    reasoning_parts=reasoning_parts)
+                    reasoning_parts=reasoning_parts, allow_file_requests=allow_file_requests)
 
             def _create_chat_completion(self, *, model=None, messages=None, timeout=None,
                                          tools=None, tool_choice=None, stream=False, **_):
