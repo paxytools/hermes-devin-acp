@@ -2,7 +2,7 @@
 
 The real plugin lives in ``hermes_devin_acp.py`` so pip can install it as a
 single-module package via the ``hermes_agent.plugins`` entry point. When
-Hermes clones this repo into ``~/.hermes/plugins/devin-acp/``, discovery
+Hermes clones this repo into its plugins directory, discovery
 imports this ``__init__.py`` via ``spec_from_file_location`` — sibling
 imports don't resolve in that path, so we load the file explicitly.
 """
