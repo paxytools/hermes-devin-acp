@@ -82,7 +82,10 @@ _SPAWN_ENV_STRIP = {"ACP_BACKEND"}
 _IDLE_TTL_SECONDS = float(os.environ.get("HERMES_DEVIN_ACP_IDLE_SECONDS", "1800"))
 _REAPER_INTERVAL_SECONDS = 60.0
 _STATE_FILENAME = "devin_acp_sessions.json"
-_AUTH_REQUIRED_RE = re.compile(r"not authenticated|not authenticated|authenticate", re.IGNORECASE)
+# Session ids owed a session/delete whose owner may have died first (SIGKILL,
+# crash). The reaper retries them once they are older than the idle TTL.
+_PENDING_DELETE_FILENAME = "devin_acp_pending_delete.json"
+_AUTH_REQUIRED_RE = re.compile(r"authenticat(e|ed|ion)", re.IGNORECASE)
 
 _ROLE_LABELS = {"system": "System", "user": "User", "assistant": "Assistant", "tool": "Tool", "context": "Context"}
 
@@ -121,13 +124,89 @@ def _message_hash(message: dict) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:24]
 
 
-def _state_path() -> Path:
+def _hermes_home() -> Path:
     try:
         from hermes_constants import get_hermes_home
 
-        return Path(get_hermes_home()) / _STATE_FILENAME
+        return Path(get_hermes_home())
     except Exception:
-        return Path(os.path.expanduser("~")) / ".hermes" / _STATE_FILENAME
+        return Path(os.path.expanduser("~")) / ".hermes"
+
+
+def _hermes_root() -> Path:
+    """Root Hermes dir — stable across per-activity profile bindings (profiles
+    live under ``<root>/profiles/<name>``)."""
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        return Path(get_default_hermes_root())
+    except Exception:
+        return _hermes_home()
+
+
+def _migrate_legacy(new_dir: Path, name: str, old: Path, *, merge: bool = False) -> None:
+    """Move a legacy state file into ``new_dir`` — never over an existing
+    target (a re-created legacy file must not clobber live state). ``merge``
+    instead unions list entries deduped by ``sid`` when several legacy
+    locations can converge on one shared file (per-profile homes → root)."""
+    try:
+        new = new_dir / name
+        if old == new or not old.exists():
+            return
+        new_dir.mkdir(parents=True, exist_ok=True)
+        if not new.exists():
+            old.replace(new)
+            return
+        if merge:
+            old_data = json.loads(old.read_text(encoding="utf-8"))
+            new_data = json.loads(new.read_text(encoding="utf-8"))
+            if isinstance(old_data, list) and isinstance(new_data, list):
+                seen = {str(e.get("sid")) for e in new_data if isinstance(e, dict)}
+                merged = new_data + [e for e in old_data
+                                     if isinstance(e, dict) and str(e.get("sid")) not in seen]
+                tmp = new.with_name(f"{new.name}.{os.getpid()}.tmp")
+                tmp.write_text(json.dumps(merged), encoding="utf-8")
+                tmp.replace(new)
+                old.unlink()
+    except Exception:
+        pass
+
+
+def _state_dir() -> Path:
+    """``<active hermes home>/plugin-data/devin-acp/`` — Hermes' per-plugin
+    storage convention (``plugins/plugin_storage.py``); the home root is for
+    core state only. Profile-scoped on purpose: the conversation→session map
+    belongs to the active profile. Falls back to computing the same path."""
+    try:
+        from plugins.plugin_storage import plugin_data_dir
+
+        return plugin_data_dir("devin-acp")
+    except Exception:
+        return _hermes_home() / "plugin-data" / "devin-acp"
+
+
+def _state_path() -> Path:
+    state_dir = _state_dir()
+    # Earlier versions parked this file at the Hermes home root.
+    _migrate_legacy(state_dir, _STATE_FILENAME, _hermes_home() / _STATE_FILENAME)
+    return state_dir / _STATE_FILENAME
+
+
+def _pending_delete_path() -> Path:
+    """Tombstone file at the profile ROOT's plugin-data — shared across all
+    profiles. Devin session rows are machine-global (not profile-scoped), so
+    one file lets any process's reaper sweep tombstones written under any
+    profile binding (e.g. the multiplex gateway's single reaper)."""
+    state_dir = _hermes_root() / "plugin-data" / "devin-acp"
+    # Legacy locations: v1 parked it at the ACTIVE home root (the profile's
+    # own dir under profiles, not the shared root); an interim build used the
+    # profile-scoped plugin-data dir. Entries merge — each profile's legacy
+    # file converges on the shared one as that profile becomes active.
+    _migrate_legacy(state_dir, _PENDING_DELETE_FILENAME,
+                    _hermes_home() / _PENDING_DELETE_FILENAME, merge=True)
+    _migrate_legacy(state_dir, _PENDING_DELETE_FILENAME,
+                    _state_dir() / _PENDING_DELETE_FILENAME, merge=True)
+    return state_dir / _PENDING_DELETE_FILENAME
 
 
 def _load_state() -> dict:
@@ -142,11 +221,68 @@ def _save_state(state: dict) -> None:
     try:
         path = _state_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(state), encoding="utf-8")
         tmp.replace(path)
     except Exception:
         pass
+
+
+_PENDING_DELETE_LOCK = threading.Lock()
+
+
+def _load_pending_delete() -> list[dict]:
+    try:
+        data = json.loads(
+            _pending_delete_path().read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            return []
+        # Normalize sid to str so corrupt entries (e.g. numeric ids) still
+        # match mark/unmark comparisons instead of looping forever.
+        return [{**e, "sid": str(e["sid"])}
+                for e in data if isinstance(e, dict) and e.get("sid")]
+    except Exception:
+        return []
+
+
+def _save_pending_delete(entries: list[dict]) -> None:
+    try:
+        path = _pending_delete_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # pid-suffixed tmp: gateway and serve processes can save concurrently.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(entries), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
+def _mark_pending_delete(session_id: str, cwd: str, *, stale: bool = False) -> None:
+    """Tombstone a session id owed a session/delete — written before the delete
+    is attempted so a crash in between still leaves it sweepable. ``stale``
+    pre-ages the entry past the idle TTL so the reaper retries it on the next
+    tick; only safe when the owning process is already dead/dying."""
+    if not session_id:
+        return
+    marked = time.time() - (_IDLE_TTL_SECONDS + 1 if stale else 0)
+    with _PENDING_DELETE_LOCK:
+        entries = _load_pending_delete()
+        for e in entries:
+            if e.get("sid") == session_id:
+                if stale:
+                    e["marked"] = marked
+                    _save_pending_delete(entries)
+                return
+        entries.append({"sid": session_id, "cwd": cwd, "marked": marked})
+        _save_pending_delete(entries)
+
+
+def _unmark_pending_delete(session_id: str) -> None:
+    with _PENDING_DELETE_LOCK:
+        entries = _load_pending_delete()
+        kept = [e for e in entries if e.get("sid") != session_id]
+        if len(kept) != len(entries):
+            _save_pending_delete(kept)
 
 
 def _format_transcript(messages: list[dict], *, fresh: bool) -> str:
@@ -199,6 +335,10 @@ class _DevinSession:
         self._write_lock = threading.Lock()  # keeps stdin writes atomic across threads
         self._authenticated = False
         self._session_result: dict = {}
+        # One-shot contexts (cron tick, dispatcher-owned kanban task): the key
+        # is stable for the run but never recurs, so the Devin row is deleted
+        # on terminate and never persisted.
+        self.ephemeral_cleanup = False
 
     # ---------- process plumbing ----------
 
@@ -242,15 +382,44 @@ class _DevinSession:
             daemon=True,
         ).start()
 
+    def _delete_session_row(self, session_id: str) -> None:
+        """Best-effort ``session/delete`` for a row this process no longer owns
+        (divergence-superseded or tombstoned). Tombstoned first — even when the
+        process is already dead — so a crash before the response lands (or a
+        dead donor) still leaves it sweepable."""
+        if not session_id:
+            return
+        _mark_pending_delete(session_id, self.cwd)
+        if not self.alive():
+            return
+        try:
+            self._request("session/delete", {"sessionId": session_id},
+                          deadline=time.monotonic() + 5.0)
+            _unmark_pending_delete(session_id)
+        except _AcpError as exc:
+            if "not found" in str(exc).lower():
+                # Row already gone (devin rm, app delete, prior delete) — nothing
+                # left to sweep; a locked/live row keeps its tombstone instead.
+                _unmark_pending_delete(session_id)
+        except Exception:
+            pass
+
     def terminate(self, delete_session: bool = False) -> None:
-        if delete_session and self.session_id and self.alive():
+        if (delete_session or self.ephemeral_cleanup) and self.session_id:
             # Ephemeral sessions (auxiliary calls) leave a permanent row in
-            # Devin's session store otherwise — delete it before dying.
-            try:
-                self._request("session/delete", {"sessionId": self.session_id},
-                              deadline=time.monotonic() + 2.0)
-            except Exception:
-                pass
+            # Devin's session store otherwise — delete it before dying. The
+            # tombstone is written even when the process is already dead so the
+            # reaper can still delete the orphaned row via a donor session.
+            # stale=True: this process is terminating either way, so a failed
+            # delete is safe to retry on the next reaper tick, not after TTL.
+            _mark_pending_delete(self.session_id, self.cwd, stale=True)
+            if self.alive():
+                try:
+                    self._request("session/delete", {"sessionId": self.session_id},
+                                  deadline=time.monotonic() + 2.0)
+                    _unmark_pending_delete(self.session_id)
+                except Exception:
+                    pass
         proc, self.proc = self.proc, None
         self.session_id = ""
         self.sent_hashes = None
@@ -378,6 +547,10 @@ class _DevinSession:
         but the conversation continued unchanged. Otherwise a fresh
         ``session/new`` starts a new Devin session.
         """
+        # A prior cancel() leaves the flag set; _request would abort instantly
+        # on it (the cancelled prompt has already exited — that's why we're
+        # reopening). Clear before any session RPCs.
+        self.cancelled.clear()
         persisted = persisted or {}
         p_hashes = persisted.get("hashes") or []
         p_sid = str(persisted.get("devin_sid") or "")
@@ -385,10 +558,14 @@ class _DevinSession:
             bool(p_sid) and persisted.get("cwd") == self.cwd
             and len(hashes) >= len(p_hashes) and hashes[:len(p_hashes)] == p_hashes
         )
+        superseded: list[str] = []
         session: dict = {}
         if self.session_id:
-            # History diverged from a live session — close the stale Devin
-            # session before opening a fresh one (keeps devin's own store tidy).
+            # History diverged from a live session — the superseded Devin
+            # session can never be resumed (the persisted map repoints to the
+            # replacement), so close it and delete the row instead of leaving
+            # an orphan in devin's store.
+            superseded.append(self.session_id)
             try:
                 self._write({"jsonrpc": "2.0", "method": "session/close",
                              "params": {"sessionId": self.session_id}})
@@ -397,6 +574,8 @@ class _DevinSession:
             self.session_id = ""
             self.sent_hashes = None
             self.applied_model = None
+            if can_resume and p_sid in superseded:
+                can_resume = False  # that sid is the session we just diverged from
         if can_resume:
             try:
                 session = self._open_with_auth_retry(
@@ -405,10 +584,19 @@ class _DevinSession:
                     deadline=deadline, dispatch=dispatch)
                 self.session_id = p_sid
                 self.sent_hashes = list(p_hashes)
+                # Resumed = live and owned again; any stale delete intent for
+                # this sid (e.g. tombstoned by another process's failed sweep
+                # while our map still pointed here) is void.
+                _unmark_pending_delete(p_sid)
                 _log.info("Devin ACP resumed session %s for %s", p_sid, self.key)
             except Exception as exc:
                 _log.info("Devin ACP session/load %s failed (%s); starting fresh.", p_sid, exc)
                 session = {}
+                superseded.append(p_sid)  # persisted row is dead once we resync
+        elif p_sid:
+            superseded.append(p_sid)  # transcript diverged while we were dead
+        for sid in dict.fromkeys(superseded):
+            self._delete_session_row(sid)
         if not self.session_id:
             session = self._open_with_auth_retry(
                 "session/new", {"cwd": self.cwd, "mcpServers": []},
@@ -417,6 +605,10 @@ class _DevinSession:
             if not self.session_id:
                 raise _AcpError("Devin ACP did not return a sessionId.")
             self.sent_hashes = []
+            if self.ephemeral_cleanup:
+                # One-shot sessions delete their row on terminate; tombstone it
+                # now so a crash before then still leaves it sweepable.
+                _mark_pending_delete(self.session_id, self.cwd)
         self._session_result = session
         self._apply_model(session, model, deadline=deadline, dispatch=dispatch)
 
@@ -460,25 +652,42 @@ class _DevinSession:
 
 _SESSIONS: dict[str, _DevinSession] = {}
 _SESSIONS_LOCK = threading.Lock()
-_PERSISTED: dict | None = None
+# Live key=None sessions (aux/delegated/ephemeral calls) — not in _SESSIONS
+# (no key), tracked here so the tombstone sweep treats their sids as
+# live-owned even after their open-time tombstone ages past the TTL.
+_EPHEMERAL: set[_DevinSession] = set()
+# Persisted map cache keyed by state-file path: the active Hermes home is
+# context-local (multiplex gateway binds the profile per call), so a single
+# process-global dict would leak one profile's map into another's file.
+_PERSISTED: dict[str, dict] = {}
 
 
 def _persisted_state() -> dict:
-    global _PERSISTED
     with _SESSIONS_LOCK:
-        if _PERSISTED is None:
+        key = str(_state_path())
+        state = _PERSISTED.get(key)
+        if state is None:
             raw = _load_state()
-            # Prune stale entries (>30 days).
+            # Prune stale entries (>30 days). A corrupt "updated" coerces to 0
+            # (pruned) — one malformed entry must not raise through here and
+            # break every call forever.
             cutoff = time.time() - 30 * 86400
-            _PERSISTED = {
+            def _ts(v: dict) -> float:
+                try:
+                    return float(v.get("updated") or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+            state = {
                 k: v for k, v in raw.items()
-                if isinstance(v, dict) and float(v.get("updated") or 0) > cutoff
+                if isinstance(v, dict) and _ts(v) > cutoff
             }
-        return _PERSISTED
+            _PERSISTED[key] = state
+        return state
 
 
 def _persist_entry(sess: _DevinSession) -> None:
-    if not sess.key or not sess.session_id or not sess.sent_hashes:
+    if (not sess.key or not sess.session_id or not sess.sent_hashes
+            or sess.ephemeral_cleanup):
         return
     state = _persisted_state()
     # serve and gateway are separate processes each caching _PERSISTED; merge
@@ -507,6 +716,55 @@ def _session_for(key: str, command: str, args: list, cwd: str) -> _DevinSession:
         return sess
 
 
+def _sweep_pending_deletes() -> None:
+    """Retry deletes for tombstoned session ids (crash recovery). Entries older
+    than the idle TTL can no longer belong to a live session owned by this
+    process; a row still locked by a live process elsewhere fails the delete
+    harmlessly and stays tombstoned for a later sweep."""
+    def _marked_ts(entry: dict) -> float:
+        try:
+            return float(entry.get("marked") or 0)
+        except (TypeError, ValueError):
+            return 0.0  # corrupt entry → epoch → expired → dropped
+
+    now = time.time()
+    entries = _load_pending_delete()
+    # Abandon tombstones older than a week — a row that still refuses deletion
+    # that long is a lost cause not worth retrying every tick forever.
+    expired = [e for e in entries if now - _marked_ts(e) > 7 * 86400]
+    for e in expired:
+        _unmark_pending_delete(str(e.get("sid") or ""))
+    cutoff = now - _IDLE_TTL_SECONDS
+    stale = [e for e in entries
+             if _marked_ts(e) < cutoff and e not in expired]
+    if not stale:
+        return
+    with _SESSIONS_LOCK:
+        sessions = list(_SESSIONS.values())
+    live_ids = {s.session_id for s in sessions if s.alive()}
+    live_ids |= {s.session_id for s in tuple(_EPHEMERAL) if s.alive()}
+    donor = next((s for s in sessions if s.alive() and not s.in_flight), None)
+    if donor is None:
+        return
+    # Hold the donor's prompt lock so a session/delete can't interleave with an
+    # in-flight prompt's response stream (responses are routed by id).
+    if not donor.lock.acquire(timeout=2.0):
+        return
+    try:
+        for entry in stale:
+            sid = str(entry.get("sid") or "")
+            if not sid or sid in live_ids:
+                continue
+            # Re-verify the tombstone still exists — a concurrent session/load
+            # that resumed this sid unmarks it, and deleting a just-resumed
+            # session would kill a live conversation's Devin state.
+            if not any(e.get("sid") == sid for e in _load_pending_delete()):
+                continue
+            donor._delete_session_row(sid)
+    finally:
+        donor.lock.release()
+
+
 def _idle_reaper() -> None:
     while True:
         time.sleep(_REAPER_INTERVAL_SECONDS)
@@ -514,10 +772,22 @@ def _idle_reaper() -> None:
             with _SESSIONS_LOCK:
                 sessions = list(_SESSIONS.values())
             for sess in sessions:
-                if (sess.alive() and not sess.in_flight
+                if not (sess.alive() and not sess.in_flight
                         and time.monotonic() - sess.last_used > _IDLE_TTL_SECONDS):
-                    _log.info("Devin ACP reaping idle session for %s", sess.key)
-                    sess.terminate()
+                    continue
+                # Take the prompt lock so terminate can't race a prompt that
+                # started between the check above and the kill; a busy session
+                # is simply retried on the next tick.
+                if not sess.lock.acquire(blocking=False):
+                    continue
+                try:
+                    if (sess.alive() and not sess.in_flight
+                            and time.monotonic() - sess.last_used > _IDLE_TTL_SECONDS):
+                        _log.info("Devin ACP reaping idle session for %s", sess.key)
+                        sess.terminate()
+                finally:
+                    sess.lock.release()
+            _sweep_pending_deletes()
         except Exception:
             pass
 
@@ -674,9 +944,9 @@ class DevinACPClient(Any):  # type: ignore[misc]
                     from agent.delegation_context import is_delegated_child_context
 
                     if is_delegated_child_context():
-                        # Delegated subagent: isolated one-shot work; keying to the
-                        # parent session would splice its transcript into the
-                        # parent's Devin history.
+                        # Delegated subagent: isolated one-shot work; it inherits
+                        # the parent's session context so keying would splice its
+                        # transcript into the parent's Devin history.
                         return None
                 except Exception:
                     pass
@@ -691,6 +961,28 @@ class DevinACPClient(Any):  # type: ignore[misc]
                             or None)
                 except Exception:
                     return None
+
+            def _devin_one_shot(self) -> bool:
+                """True for run-scoped contexts whose key is stable for the run
+                but never recurs — cron ticks (HERMES_CRON_SESSION) and
+                dispatcher-owned kanban task executions. The shared session
+                still serves the run's API calls (deltas), but its Devin row is
+                deleted on terminate and never persisted."""
+                try:
+                    from agent.delegation_context import owned_kanban_task
+
+                    if owned_kanban_task():
+                        return True
+                except Exception:
+                    pass
+                try:
+                    from gateway.session_context import get_session_env
+
+                    if get_session_env("HERMES_CRON_SESSION", ""):
+                        return True
+                except Exception:
+                    pass
+                return False
 
             def _devin_dispatch(self, sess, text_parts, reasoning_parts, *, record_updates):
                 """Bind this client's message handler for a _DevinSession request loop."""
@@ -974,6 +1266,8 @@ class DevinACPClient(Any):  # type: ignore[misc]
                     return self._devin_ephemeral(messages, model=model, deadline=deadline)
                 sess = _session_for(key, self._acp_command, self._acp_args, self._acp_cwd)
                 self._devin_session = sess
+                if self._devin_one_shot():
+                    sess.ephemeral_cleanup = True
                 if getattr(sess, "owner_tid", None) == threading.get_ident():
                     # Reentrant call on the thread already holding sess.lock —
                     # a non-reentrant acquire here would self-deadlock (e.g. an
@@ -1038,6 +1332,10 @@ class DevinACPClient(Any):  # type: ignore[misc]
             def _devin_ephemeral(self, messages, *, model, deadline):
                 sess = _DevinSession(None, self._acp_command, self._acp_args, self._acp_cwd)
                 self._devin_session = sess
+                # Same delete-on-die contract as keyed one-shot sessions: the
+                # open-time tombstone covers a SIGKILL that skips the finally.
+                sess.ephemeral_cleanup = True
+                _EPHEMERAL.add(sess)  # live-owned: sweep must skip its tombstone
                 try:
                     setup_dispatch = self._devin_dispatch(sess, None, None, record_updates=False)
                     sess.ensure_ready(deadline=deadline, dispatch=setup_dispatch)
@@ -1056,6 +1354,7 @@ class DevinACPClient(Any):  # type: ignore[misc]
                         interrupted=interrupted)
                     return "".join(text_parts), "".join(reasoning_parts)
                 finally:
+                    _EPHEMERAL.discard(sess)
                     sess.terminate(delete_session=True)
 
             def close(self) -> None:
