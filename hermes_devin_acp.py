@@ -1373,6 +1373,30 @@ class DevinACPClient(Any):  # type: ignore[misc]
         return _DevinClient(**kwargs)
 
 
+def _default_acp_cwd() -> str:
+    """Resolve the ACP session workspace root.
+
+    Defaults to the Hermes home dir (``get_hermes_home()``, profile-aware)
+    so Devin's native tools (read, exec, edit) can reach everything the
+    agent actually needs — config, price-watches, plugins, bridges — while
+    keeping workspace scans out of macOS TCC-protected folders. (Rooting
+    at ``~`` made an unrestricted ``find`` descend into Desktop/Photos/
+    Media Library, prompting once per protected service, per session.)
+
+    ``HERMES_DEVIN_ACP_CWD`` widens or relocates the root (``~``
+    expanded), matching the ``HERMES_DEVIN_ACP_COMMAND``/
+    ``HERMES_DEVIN_ACP_ARGS`` operator-override convention.
+    """
+    raw = os.environ.get("HERMES_DEVIN_ACP_CWD")
+    if not raw:
+        try:
+            from hermes_constants import get_hermes_home
+            raw = str(get_hermes_home())
+        except Exception:
+            raw = os.environ.get("HERMES_HOME") or "~"
+    return os.path.abspath(os.path.expanduser(raw))
+
+
 class DevinACPProfile(ProviderProfile):
     """Devin CLI models using your authenticated subscription, over ACP stdio."""
 
@@ -1386,11 +1410,7 @@ class DevinACPProfile(ProviderProfile):
         """
         client_kwargs.setdefault("acp_command", self.process_command)
         client_kwargs.setdefault("acp_args", list(self.process_args))
-        # Use the user's home directory as the ACP session cwd so Devin's native
-        # tools (read, exec, edit) can access the Hermes home dir and other
-        # project dirs. The base class defaults to os.getcwd(), which is too
-        # narrow when Hermes runs from its install tree.
-        client_kwargs.setdefault("acp_cwd", os.path.expanduser("~"))
+        client_kwargs.setdefault("acp_cwd", _default_acp_cwd())
         return DevinACPClient(**client_kwargs)
 
     def fetch_models(
