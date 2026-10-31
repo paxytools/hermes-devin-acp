@@ -19,9 +19,11 @@ what Devin saw (compaction, edits) the Devin session is rebuilt from the full
 transcript; if the process died (idle reaper, crash, Hermes restart) the Devin
 session is resumed via ``session/load`` so the conversation still continues in
 the same Devin session row. Auth stays inside the Devin CLI (``devin auth
-login``); when the ACP server demands an explicit ``authenticate`` (nested-ACP
-environments where ``ACP_BACKEND`` is set) the plugin authenticates with the
-CLI's own stored API key and never logs it.
+login``): current Devin builds never read local CLI credentials in ACP mode
+("the ACP host is the sole source of credentials"), so ``authenticate`` is
+required before ``session/new`` on every spawned process. The plugin
+authenticates with the CLI's own stored API key
+(``$XDG_DATA_HOME/devin/credentials.toml``) and never logs it.
 
 This is a standalone plugin (installed via ``hermes plugins install paxytools/hermes-devin-acp``
 into the Hermes home's ``plugins/`` directory) or pip-installed via the ``hermes_agent.plugins`` entry
@@ -39,6 +41,7 @@ import logging
 import os
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -71,10 +74,10 @@ _DEVIN_PROMPT_PREAMBLE = (
     "If no tool is needed, answer normally.",
 )
 
-# Env vars that mark "we are inside an ACP host". When ACP_BACKEND is set (e.g.
-# Hermes launched from a terminal inside Windsurf/Devin), `devin acp` refuses
-# session/new until the host calls `authenticate`; stripping it restores the
-# normal local-credential path, with `authenticate` as a fallback.
+# Env vars stripped from the child's environment. ACP_BACKEND marked "we are
+# inside an ACP host" on older Devin builds (which then required authenticate);
+# current builds require authenticate unconditionally, so stripping is now a
+# defensive no-op kept for stale environments.
 _SPAWN_ENV_STRIP = {"ACP_BACKEND"}
 
 # Idle `devin acp` processes are terminated after this many seconds. The Devin
@@ -101,10 +104,9 @@ class _AcpError(RuntimeError):
 def _devin_credentials_api_key() -> str:
     """Read the Devin CLI's own API key from its credentials file.
 
-    Only consulted when ``session/new`` fails demanding an explicit
-    ``authenticate`` call (the nested-ACP path the CLI itself prescribes:
-    "Call the `authenticate` ACP method with `meta.api_key` set to the user's
-    API key"). The value is never logged or persisted by this plugin.
+    This is the credential the ``authenticate`` ACP method requires (the CLI's
+    own guidance: "Call the `authenticate` ACP method with `meta.api_key` set to
+    the user's API key"). The value is never logged or persisted by this plugin.
     """
     try:
         data_home = os.environ.get("XDG_DATA_HOME", "").strip() or os.path.join(
@@ -516,13 +518,18 @@ class _DevinSession:
             return False
 
     def ensure_ready(self, *, deadline: float, dispatch) -> None:
-        """Process alive + initialized. Does NOT open an ACP session."""
+        """Process alive + initialized + authenticated. Does NOT open a session."""
         if self.alive():
             return
         self.cancelled.clear()
         self._spawn()
         self._authenticated = False
         self._request("initialize", _ACP_INITIALIZE_PARAMS, deadline=deadline, dispatch=dispatch)
+        # Devin's ACP server never uses local CLI credentials, so authenticate is
+        # mandatory before session/new — send it proactively instead of paying a
+        # failed-request round trip. _open_with_auth_retry stays as the safety
+        # net (no key at spawn time, key rotated mid-process, server-side expiry).
+        self._authenticate(deadline=deadline, dispatch=dispatch)
         self.session_id = ""
         self.sent_hashes = None
         self.applied_model = None
@@ -611,6 +618,68 @@ class _DevinSession:
                 _mark_pending_delete(self.session_id, self.cwd)
         self._session_result = session
         self._apply_model(session, model, deadline=deadline, dispatch=dispatch)
+        self._ensure_thought_level(session, deadline=deadline, dispatch=dispatch)
+
+    def _restore_config_values(self, before: dict, after: dict, *, deadline: float, dispatch) -> None:
+        """Devin resets per-model config options to the new model's defaults on a
+        switch (e.g. ``thought_level`` high → medium, which stops
+        ``agent_thought_chunk`` streaming). Restore the pre-switch value of any
+        non-model option that changed and still offers that value, so picking a
+        model can't silently downgrade thinking effort or speed."""
+        after_opts = {o.get("id"): o for o in (after.get("configOptions") or [])
+                      if isinstance(o, dict)}
+        for option in (before.get("configOptions") or []):
+            if not isinstance(option, dict):
+                continue
+            cid = str(option.get("id") or "")
+            old = str(option.get("currentValue") or "")
+            if not cid or cid == "model" or not old:
+                continue
+            new_opt = after_opts.get(cid)
+            if not new_opt or str(new_opt.get("currentValue") or "") == old:
+                continue
+            offered = {str(o.get("value") or "") for o in new_opt.get("options") or []
+                       if isinstance(o, dict)}
+            if old not in offered:
+                continue
+            try:
+                self._request("session/set_config_option",
+                              {"sessionId": self.session_id, "configId": cid, "value": old},
+                              deadline=deadline, dispatch=dispatch)
+            except Exception as exc:
+                _log.info("Devin ACP could not restore config option %s=%r: %s", cid, old, exc)
+
+    def _ensure_thought_level(self, session: dict, *, deadline: float, dispatch) -> None:
+        """Pin ``thought_level`` so thinking can't silently sit degraded.
+
+        A session resumed via ``session/load`` keeps whatever level it ended on —
+        including ``medium``/``none`` left by an older process or a model switch,
+        where Devin emits zero ``agent_thought_chunk``s (restore-on-change can't
+        help: nothing changed). Desired level: ``HERMES_DEVIN_ACP_THOUGHT_LEVEL``
+        (default ``high``), applied only when the option exists, offers that
+        value, and differs from current. ``none`` disables the pin."""
+        desired = (os.environ.get("HERMES_DEVIN_ACP_THOUGHT_LEVEL", "high")
+                   or "high").strip().lower()
+        if desired in ("", "none", "off"):
+            return
+        option = next((o for o in (session.get("configOptions") or [])
+                       if isinstance(o, dict) and "thought" in str(o.get("id") or "")), None)
+        if not option:
+            return
+        current = str(option.get("currentValue") or "").strip()
+        offered = {str(o.get("value") or "") for o in option.get("options") or []
+                   if isinstance(o, dict)}
+        if current == desired or desired not in offered:
+            return
+        try:
+            self._request("session/set_config_option",
+                          {"sessionId": self.session_id,
+                           "configId": str(option.get("id")), "value": desired},
+                          deadline=deadline, dispatch=dispatch)
+            option["currentValue"] = desired
+            _log.info("Devin ACP thought_level %s -> %s", current, desired)
+        except Exception as exc:
+            _log.info("Devin ACP thought_level pin failed: %s", exc)
 
     def _apply_model(self, session: dict, model: str | None, *, deadline: float, dispatch) -> None:
         requested = str(model or "").strip()
@@ -620,8 +689,12 @@ class _DevinSession:
             from agent.copilot_acp_client import _model_selection_request
 
             if (selection := _model_selection_request(session, requested)) is not None:
-                self._request(selection[0], selection[1], deadline=deadline, dispatch=dispatch)
+                result = self._request(selection[0], selection[1],
+                                       deadline=deadline, dispatch=dispatch) or {}
                 self.applied_model = requested
+                self._restore_config_values(session, result, deadline=deadline, dispatch=dispatch)
+                if isinstance(result, dict) and result.get("configOptions"):
+                    self._session_result["configOptions"] = result["configOptions"]
             else:
                 _log.warning("Devin ACP does not offer model %r; using the session default.", requested)
         except Exception as exc:
@@ -831,35 +904,85 @@ class DevinACPClient(Any):  # type: ignore[misc]
                 self._devin_session = None
 
             def _devin_agent(self):
-                """Resolve the current turn's agent via the runtime session ContextVar.
+                """Resolve the current turn's agent.
 
-                The ContextVar is set on the turn thread (``_run_prompt_submit``'s
-                ``run()`` function) and propagated via ``copy_context()`` to worker
-                threads. Title generation does NOT set it, so background calls are
-                naturally excluded. Returns ``None`` when no main turn is active.
+                Primary: the runtime-session ContextVar (works where the turn
+                thread's context reaches). When it resolves — typically during
+                session open, which runs on the context-bearing thread — cache it
+                on the session: API-call dispatches later run on worker threads
+                where no ContextVar propagates, and the messaging gateway's
+                sessions aren't in ``tui_gateway._sessions`` at all.
                 """
+                try:
+                    from agent.auxiliary_client import _RELAY_AUX_CALL_CONTEXT
+                    if _RELAY_AUX_CALL_CONTEXT.get() is not None:
+                        return None
+                except Exception:
+                    pass
+                if threading.current_thread().name == "bg-review":
+                    return None
+                try:
+                    from agent.delegation_context import is_delegated_child_context
+                    if is_delegated_child_context():
+                        return None
+                except Exception:
+                    pass
+                cached = getattr(self, "_devin_cached_agent", None)
+                if cached is not None:
+                    return cached
                 try:
                     from tui_gateway.server import _current_runtime_session_record
                     session = _current_runtime_session_record.get()
-                    if session is None:
-                        return None
-                    return session.get("agent")
+                    agent = session.get("agent") if session is not None else None
                 except Exception:
-                    return None
-
-            def _devin_sid(self):
-                """Resolve the current turn's UI session ID via the runtime session ContextVar."""
-                try:
-                    from tui_gateway.server import _current_runtime_session_record, _sessions
-                    session = _current_runtime_session_record.get()
-                    if session is None:
-                        return ""
-                    for sid, sess in _sessions.items():
-                        if sess is session:
-                            return sid
-                    return ""
-                except Exception:
-                    return ""
+                    agent = None
+                if agent is None:
+                    try:
+                        from tui_gateway.server import _sessions
+                        key = str(getattr(self, "key", "") or "")
+                        for sess in _sessions.values():
+                            a = sess.get("agent")
+                            if a is not None and key and (
+                                    str(getattr(a, "session_id", "") or "") == key
+                                    or str(sess.get("session_key") or "") == key):
+                                agent = a
+                                break
+                    except Exception:
+                        pass
+                if agent is None:
+                    # Last resort: the agent IS on the call stack —
+                    # run_conversation -> client.chat.completions.create -> here.
+                    # Walk frames for an object with the agent's surface
+                    # (session_id + _fire_reasoning_delta). Works on every
+                    # surface/thread; no ContextVar or registry dependency.
+                    try:
+                        import inspect
+                        frame = inspect.currentframe()
+                        depth = 0
+                        while frame is not None and depth < 60:
+                            for candidate in (frame.f_locals.get("self"),
+                                              frame.f_locals.get("agent")):
+                                if (candidate is not None
+                                        and candidate is not self
+                                        and hasattr(candidate, "_fire_reasoning_delta")
+                                        and hasattr(candidate, "session_id")
+                                        and hasattr(candidate, "_session_db")):
+                                    agent = candidate
+                                    break
+                            if agent is not None:
+                                break
+                            frame = frame.f_back
+                            depth += 1
+                        del frame
+                    except Exception:
+                        pass
+                if agent is not None:
+                    self._devin_cached_agent = agent
+                elif not getattr(self, "_devin_dump_logged", False):
+                    self._devin_dump_logged = True
+                    _log.info("Devin ACP agent lookup miss: key=%r",
+                              str(getattr(self, "key", "") or ""))
+                return agent
 
             def _devin_persist(self, agent, content, display_kind, *,
                               role="assistant", tool_calls=None,
@@ -896,8 +1019,8 @@ class DevinACPClient(Any):  # type: ignore[misc]
                             lambda conn: conn.execute(
                                 "UPDATE messages SET active = 0, compacted = 1 WHERE id = ?",
                                 (row_id,)))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.warning("Devin ACP display-row persist failed (%s): %s", display_kind, exc)
 
             def _devin_flush_thinking(self, agent):
                 """Flush accumulated thinking as its own persisted DB row, then clear the buffer.
@@ -1112,10 +1235,26 @@ class DevinACPClient(Any):  # type: ignore[misc]
                         process.stdin.write(json.dumps(response) + "\n")
                         process.stdin.flush()
                     return True
+                methods_seen = getattr(self, "_devin_methods_seen", None)
+                if methods_seen is None:
+                    methods_seen = self._devin_methods_seen = set()
+                key = method if method != "session/update" else (
+                    f"session/update:{((msg.get('params') or {}).get('update') or {}).get('sessionUpdate', '')}")
+                if key and key not in methods_seen:
+                    methods_seen.add(key)
+                    _log.info("Devin ACP inbound: %s", key)
                 if method == "session/update":
                     update = (msg.get("params") or {}).get("update") or {}
                     utype = update.get("sessionUpdate", "")
                     agent = self._devin_agent()
+                    if agent is None and utype in ("agent_thought_chunk", "tool_call") \
+                            and not getattr(self, "_devin_no_agent_logged", False):
+                        # Agent resolution failed — thinking/tool display rows are
+                        # silently dropped on this surface (expected on messaging
+                        # gateway, suspicious on desktop/TUI). Log once per client.
+                        self._devin_no_agent_logged = True
+                        _log.info("Devin ACP received %s but no agent context resolved; "
+                                  "display rows will be skipped for this call.", utype)
                     if agent is not None:
                         if utype == "agent_thought_chunk":
                             # Stream thinking live via the agent's reasoning-delta
@@ -1308,6 +1447,8 @@ class DevinACPClient(Any):  # type: ignore[misc]
                         # Model may have changed mid-conversation on the same session.
                         sess._apply_model(sess._session_result, model,
                                           deadline=deadline, dispatch=setup_dispatch)
+                        sess._ensure_thought_level(sess._session_result,
+                                                   deadline=deadline, dispatch=setup_dispatch)
                         text_parts: list = []
                         reasoning_parts: list = []
                         interrupted = (lambda: bool(getattr(agent, "_interrupt_requested", False))
@@ -1397,6 +1538,56 @@ def _default_acp_cwd() -> str:
     return os.path.abspath(os.path.expanduser(raw))
 
 
+def _config_option_model_ids(session: dict) -> list[str] | None:
+    """Ordered model ``value``s from the session's model ``configOptions`` entry —
+    the ids ``session/set_config_option`` accepts. Entries marked disabled via
+    ``_meta.copilotEnablement`` (the ACP enablement convention the base class
+    honors) are skipped."""
+    for option in (session.get("configOptions") or []):
+        if not isinstance(option, dict):
+            continue
+        if "model" not in (option.get("category"), option.get("id")):
+            continue
+        ids: list[str] = []
+        for opt in option.get("options") or []:
+            if not isinstance(opt, dict):
+                continue
+            value = str(opt.get("value") or "").strip()
+            disabled = (str((opt.get("_meta") or {}).get("copilotEnablement") or "")
+                        .strip().lower() == "disabled")
+            if value and not disabled and value not in ids:
+                ids.append(value)
+        if ids:
+            return ids
+    return None
+
+
+def _models_from_json(stdout: str) -> list[str]:
+    """Model ids out of ``devin models list --format json``. Tolerant of the
+    exact shape: a top-level list, or a list under ``models``/``data``, of
+    strings or objects keyed by a model-id-ish field."""
+    try:
+        data = json.loads(stdout)
+    except Exception:
+        return []
+    rows = data if isinstance(data, list) else next(
+        (data[k] for k in ("models", "data") if isinstance(data, dict)
+         and isinstance(data.get(k), list)), [])
+    ids: list[str] = []
+    for row in rows:
+        if isinstance(row, str):
+            value = row.strip()
+        elif isinstance(row, dict):
+            value = next((str(row.get(k)).strip() for k in
+                          ("id", "slug", "value", "modelId", "model_id")
+                          if str(row.get(k) or "").strip()), "")
+        else:
+            continue
+        if value:
+            ids.append(value)
+    return ids
+
+
 class DevinACPProfile(ProviderProfile):
     """Devin CLI models using your authenticated subscription, over ACP stdio."""
 
@@ -1413,6 +1604,81 @@ class DevinACPProfile(ProviderProfile):
         client_kwargs.setdefault("acp_cwd", _default_acp_cwd())
         return DevinACPClient(**client_kwargs)
 
+    def _resolved_launch(self) -> tuple[str, list[str]]:
+        """``(command, args)`` honoring the same env overrides as ``create_client``
+        (``HERMES_DEVIN_ACP_COMMAND`` / ``HERMES_DEVIN_ACP_ARGS``), resolved the
+        way ``hermes_cli.auth._external_process_spec`` does it."""
+        command = (next((v for v in (os.environ.get(var, "").strip()
+                                     for var in self.process_command_env_vars) if v), "")
+                   or str(self.process_command or ""))
+        raw_args = (os.environ.get(self.process_args_env_var, "").strip()
+                    if self.process_args_env_var else "")
+        args = shlex.split(raw_args) if raw_args else list(self.process_args or ())
+        return command, args
+
+    def _models_via_acp(self, command: str, args: list[str], deadline: float) -> list[str] | None:
+        """Read the model ``configOptions`` of a throwaway authenticated session.
+
+        This is the authoritative catalog: the ``value`` ids are exactly what
+        ``session/set_config_option`` accepts, and it works even when
+        ``devin models list`` refuses (e.g. the REPL credential check is
+        stricter than the ACP ``authenticate`` path). The probe session's row
+        is deleted on terminate, so this leaves nothing in ``devin``'s list.
+        """
+        sess = _DevinSession(None, command, list(args), _default_acp_cwd())
+        sess.ephemeral_cleanup = True
+        try:
+            def _dispatch(msg):
+                # Setup-only probe: swallow notifications; error any server->client
+                # request (fs access, permissions) so nothing can stall the probe.
+                # Messages without "method" are RPC responses — return False so
+                # _request can match them by id.
+                if not msg.get("method"):
+                    return False
+                if msg.get("id") is not None:
+                    sess._write({"jsonrpc": "2.0", "id": msg["id"],
+                                 "error": {"code": -32601,
+                                           "message": "unsupported during model discovery"}})
+                return True
+
+            sess.ensure_ready(deadline=deadline, dispatch=_dispatch)
+            sess.open_session(model=None, hashes=[], deadline=deadline,
+                              dispatch=_dispatch, persisted=None)
+            return _config_option_model_ids(sess._session_result)
+        except Exception as exc:
+            _log.info("Devin ACP model discovery via session failed: %s", exc)
+            return None
+        finally:
+            sess.terminate(delete_session=True)
+
+    def _models_via_cli(self, command: str, deadline: float) -> list[str] | None:
+        """``devin models list`` fallback: prefer ``--format json``, then the
+        two-space-indented text table."""
+        for extra in (["--format", "json"], []):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                completed = subprocess.run(
+                    [command, "models", "list", *extra],
+                    capture_output=True,
+                    text=True,
+                    timeout=remaining,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return None
+            if completed.returncode != 0:
+                continue  # e.g. an older CLI without --format — try the next form
+            if not extra:
+                models = [m.group(1) for line in completed.stdout.splitlines()
+                          if (m := _MODEL_LINE.match(line))]
+            else:
+                models = _models_from_json(completed.stdout)
+            if models:
+                return list(dict.fromkeys(models))
+        return None
+
     def fetch_models(
         self,
         *,
@@ -1420,28 +1686,14 @@ class DevinACPProfile(ProviderProfile):
         base_url: str | None = None,
         timeout: float = 8.0,
     ) -> list[str] | None:
-        """Discover the model catalog from the authenticated Devin CLI."""
-        command = shutil.which(self.process_command)
-        if not command:
+        """Discover the model catalog. Prefers the ACP session's model
+        ``configOptions`` (ids ``session/set_config_option`` accepts) and falls
+        back to ``devin models list``."""
+        command, args = self._resolved_launch()
+        if not command or not shutil.which(command):
             return None
-        try:
-            completed = subprocess.run(
-                [command, "models", "list"],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if completed.returncode != 0:
-            return None
-        models: list[str] = []
-        for line in completed.stdout.splitlines():
-            match = _MODEL_LINE.match(line)
-            if match:
-                models.append(match.group(1))
-        return list(dict.fromkeys(models)) or None
+        deadline = time.monotonic() + max(float(timeout or 0), 5.0)
+        return self._models_via_acp(command, args, deadline) or self._models_via_cli(command, deadline)
 
 
 devin_acp = DevinACPProfile(
@@ -1459,7 +1711,12 @@ devin_acp = DevinACPProfile(
     process_args=("acp",),
     process_command_env_vars=("HERMES_DEVIN_ACP_COMMAND",),
     process_args_env_var="HERMES_DEVIN_ACP_ARGS",
-    fallback_models=("opus", "sonnet", "gpt", "gemini", "swe"),
+    # Last-resort catalog when both discovery paths fail: real
+    # session/set_config_option values (fuzzy aliases like "opus" don't match).
+    fallback_models=("adaptive", "swe-2-high", "claude-opus-5-5-medium",
+                     "claude-sonnet-5-5-medium", "claude-fable-5-1-medium",
+                     "gpt-6-astra-medium", "gpt-6-sol-medium",
+                     "gemini-4-argon-medium", "kimi-k3-high", "glm-5-2"),
 )
 
 register_provider(devin_acp)
@@ -1514,18 +1771,31 @@ try:
 except Exception:
     pass  # non-fatal; the provider still works via --provider devin-acp.
 
-# The dashboard Accounts tab renders a sign-in command per provider. For providers not in the
-# curated _OAUTH_PROVIDER_CATALOG it auto-generates ``hermes auth add <slug>`` and then
-# displays "Sign in with Devin CLI". For external_process providers we provide a
-# human-readable sign-in hint instead of the auto-generated ``hermes auth add``
-# command, since auth happens inside the Devin CLI.
+# The dashboard Accounts tab renders a sign-in command per provider. Without a curated
+# ``_OAUTH_PROVIDER_CATALOG`` card it auto-derives ``hermes auth add <slug>`` — wrong for
+# external_process providers, whose auth lives in their own CLI. The catalog now lives in
+# ``hermes_cli.web_server_oauth`` as a tuple of row dicts (id/name/flow/cli_command/
+# docs_url/status_fn); the router reads it through a LateState proxy that resolves the
+# module attribute lazily, so rebinding the tuple here is picked up. Older Hermes builds
+# kept a dict in ``hermes_cli.providers`` instead — the fallback below covers both.
 try:
-    from hermes_cli.providers import _OAUTH_PROVIDER_CATALOG
+    import hermes_cli.web_server_oauth as _devin_wso
 
-    if "devin-acp" not in _OAUTH_PROVIDER_CATALOG:
-        _OAUTH_PROVIDER_CATALOG["devin-acp"] = {
-            "signin_hint": "Run `devin auth login` in your terminal to authenticate.",
-            "signin_url": "https://app.devin.ai/",
-        }
+    if not any(isinstance(e, dict) and e.get("id") == "devin-acp"
+               for e in _devin_wso._OAUTH_PROVIDER_CATALOG):
+        _devin_wso._OAUTH_PROVIDER_CATALOG = _devin_wso._OAUTH_PROVIDER_CATALOG + ({
+            "id": "devin-acp", "name": "Devin (ACP)", "flow": "external",
+            "cli_command": "devin auth login", "docs_url": "https://devin.ai/",
+            "status_fn": None},)
 except Exception:
-    pass  # non-fatal; the dashboard still works without this entry.
+    # Legacy schema: dict keyed by slug carrying signin_hint/signin_url.
+    try:
+        from hermes_cli.providers import _OAUTH_PROVIDER_CATALOG
+
+        if "devin-acp" not in _OAUTH_PROVIDER_CATALOG:
+            _OAUTH_PROVIDER_CATALOG["devin-acp"] = {
+                "signin_hint": "Run `devin auth login` in your terminal to authenticate.",
+                "signin_url": "https://app.devin.ai/",
+            }
+    except Exception:
+        pass  # non-fatal; the auto-derived row still lists the provider.

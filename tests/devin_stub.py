@@ -59,15 +59,52 @@ for line in sys.stdin:
     mid, method = msg.get("id"), msg.get("method")
     params = msg.get("params") or {}
     st = load()
+    st.setdefault("calls", []).append(method)
+    save(st)
     resp, err = {}, None
     if method == "initialize":
         resp = {"protocolVersion": 1, "agentCapabilities": {}}
     elif method == "session/new":
         sid = "stub-%d" % st["next"]
         st["next"] += 1
-        st["sessions"][sid] = {"cwd": params.get("cwd"), "prompts": 0, "texts": []}
+        st["sessions"][sid] = {"cwd": params.get("cwd"), "prompts": 0, "texts": [],
+                               "config": {"model": "swe-2-high", "thought_level": "high"}}
         save(st)
-        resp = {"sessionId": sid}
+        resp = {"sessionId": sid, "configOptions": [
+            {"id": "mode", "category": "mode", "type": "select",
+             "currentValue": "accept-edits",
+             "options": [{"value": "accept-edits"}, {"value": "bypass"}]},
+            {"id": "model", "category": "model", "type": "select",
+             "currentValue": "swe-2-high",
+             "options": [{"value": "swe-2-high"},
+                         {"value": "claude-opus-5-5-medium"},
+                         {"value": "claude-opus-5-5-medium"},
+                         {"value": "disabled-model",
+                          "_meta": {"copilotEnablement": "disabled"}}]},
+            {"id": "thought_level", "category": "thought_level", "type": "select",
+             "currentValue": "high",
+             "options": [{"value": "low"}, {"value": "medium"}, {"value": "high"}]},
+        ]}
+    elif method == "session/set_config_option":
+        sid = params.get("sessionId")
+        if sid not in st["sessions"]:
+            err = {"code": -32602, "message": "session %s not found in store" % sid}
+        else:
+            cfg = st["sessions"][sid].setdefault(
+                "config", {"model": "swe-2-high", "thought_level": "high"})
+            cfg[params.get("configId")] = params.get("value")
+            if params.get("configId") == "model":
+                # Devin resets per-model options to the new model's defaults.
+                cfg["thought_level"] = "medium"
+            save(st)
+            resp = {"configOptions": [
+                {"id": "model", "category": "model", "type": "select",
+                 "currentValue": cfg["model"],
+                 "options": [{"value": "swe-2-high"}, {"value": "claude-opus-5-5-medium"}]},
+                {"id": "thought_level", "category": "thought_level", "type": "select",
+                 "currentValue": cfg["thought_level"],
+                 "options": [{"value": "low"}, {"value": "medium"}, {"value": "high"}]},
+            ]}
     elif method == "session/load":
         sid = params.get("sessionId")
         if sid in st["sessions"]:
